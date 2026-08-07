@@ -1,0 +1,7 @@
+{
+  "name": "MotorVelocity",
+  "version": "1.0.0",
+  "description": "Controle de velocidade de motor de passo com A4988 e AccelStepper",
+  "frameworks": "arduino",
+  "platforms": "atmelavr"
+}
