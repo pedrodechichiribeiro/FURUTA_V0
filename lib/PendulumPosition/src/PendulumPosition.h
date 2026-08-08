@@ -1,8 +1,6 @@
-#ifndef PENDULUM_POSITION_H
-#define PENDULUM_POSITION_H
+#pragma once
 
 #include <Arduino.h>
-#include <Wire.h>
 #include <AS5600.h>
 
 /**
@@ -17,115 +15,75 @@
  *
  * Esta classe não calcula velocidade.
  */
+
+
+
 class PendulumPosition
 {
 public:
-    /**
-     * Inicializa o barramento I2C e o AS5600.
-     *
-     * Retorna true quando o sensor responde no endereço 0x36.
-     */
-    bool begin(
-        uint32_t i2cClockHz = 100000UL,
-        uint8_t direction = AS5600_CLOCK_WISE
-    );
 
-    /**
-     * Realiza uma única leitura do AS5600 e atualiza
-     * todas as variáveis de posição.
-     */
+    PendulumPosition(AS5600 &sensor, float directionSign = 1.0F);
+
+    // Inicializa o AS5600.
+    bool begin();
+
+    // Faz uma nova leitura do sensor.
     bool update();
 
-    /**
-     * Define a posição atual como a posição inferior:
-     *
-     * alpha = 0 rad.
-     *
-     * O pêndulo deve estar parado e voltado para baixo.
-     */
-    void defineLowerReference();
+    // Define a posição vertical superior como beta = 0.
+    // Faz várias leituras para reduzir o efeito de ruído.
+    bool calibrateTop(
+        uint8_t numberOfSamples = 32,
+        uint16_t intervalMilliseconds = 2
+    );
 
-    bool isConnected() const;
-    bool isReferenceDefined() const;
+    bool topIsDefined() const;
+
+    // Leitura bruta 0 ... 4095.
+    uint16_t raw() const;
+
+    // Ângulo absoluto do AS5600 em radianos.
+    float absoluteAngleRadians() const;
+
+    // Erro angular em relação ao topo:
+    //
+    // -PI <= beta < PI
+    //
+    float betaRadians() const;
+
+    uint16_t topRaw() const;
+
+    int lastError() const;
 
     bool magnetDetected();
     bool magnetTooWeak();
     bool magnetTooStrong();
 
-    uint16_t magneticMagnitude();
-
-    /**
-     * Leitura direta do AS5600:
-     *
-     * 0 até 4095.
-     */
-    uint16_t rawAngle() const;
-
-    /**
-     * Posição acumulada em contagens do AS5600.
-     *
-     * Pode ultrapassar 4095 ou assumir valores negativos.
-     */
-    int32_t cumulativeCounts() const;
-
-    /**
-     * Posição angular contínua em radianos.
-     *
-     * A origem desta variável é interna à biblioteca AS5600.
-     * Ela é usada pela biblioteca de velocidade porque não
-     * sofre saltos entre 0 e 360 graus.
-     */
-    float continuousAngleRad() const;
-
-    /**
-     * Ângulo contínuo medido a partir da posição inferior.
-     *
-     * Pode ultrapassar uma volta.
-     */
-    float angleFromLowerUnwrappedRad() const;
-
-    /**
-     * Ângulo medido a partir da posição inferior,
-     * limitado entre 0 e 2*PI.
-     *
-     * 0 rad  = pêndulo para baixo.
-     * PI rad = pêndulo para cima.
-     */
-    float angleFromLowerWrappedRad() const;
-
-    /**
-     * Erro em torno da posição vertical:
-     *
-     * 0 rad = pêndulo vertical para cima.
-     *
-     * Resultado limitado entre -PI e +PI.
-     */
-    float equilibriumErrorRad() const;
 
 private:
-    static constexpr float RAD_PER_COUNT =
-        6.28318530717958647692F / 4096.0F;
 
-    AS5600 sensor_;
+    // Diferença circular entre duas leituras de 12 bits.
+    //
+    // resultado:
+    //
+    // -2048 ... +2047
+    //
+    static int16_t circularDifference(
+        uint16_t current,
+        uint16_t reference
+    );
 
-    bool connected_ = false;
-    bool referenceDefined_ = false;
+    AS5600 &sensor_;
 
-    uint16_t rawAngle_ = 0;
-    int32_t cumulativeCounts_ = 0;
+    float directionSign_;
 
-    float continuousAngleRad_ = 0.0F;
+    uint16_t raw_;
+    uint16_t topRaw_;
 
-    float lowerReferenceContinuousRad_ = 0.0F;
+    float absoluteAngleRadians_;
+    float betaRadians_;
 
-    float angleFromLowerUnwrappedRad_ = 0.0F;
-    float angleFromLowerWrappedRad_ = 0.0F;
-    float equilibriumErrorRad_ = 0.0F;
+    bool topDefined_;
 
-    void updateDerivedAngles();
-
-    static float wrapToPi(float angle);
-    static float wrapToTwoPi(float angle);
+    int lastError_;
 };
-
-#endif

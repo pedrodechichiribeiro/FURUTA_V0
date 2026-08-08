@@ -1,104 +1,91 @@
-#ifndef PENDULUM_VELOCITY_H
-#define PENDULUM_VELOCITY_H
+#pragma once
 
 #include <Arduino.h>
 
-/**
- * Calcula a velocidade angular a partir da posição
- * angular contínua.
- *
- * Esta classe não conhece o AS5600 e não realiza
- * comunicação I2C.
- *
- * Entrada:
- *   posição contínua em radianos;
- *   instante da amostra em microssegundos.
- *
- * Saídas:
- *   velocidade bruta em rad/s;
- *   velocidade filtrada em rad/s.
- */
+
 class PendulumVelocity
 {
 public:
-    /**
-     * filterTauSeconds:
-     *
-     * Constante de tempo do filtro passa-baixas.
-     *
-     * Valor menor:
-     *   - resposta mais rápida;
-     *   - mais ruído.
-     *
-     * Valor maior:
-     *   - resposta mais suave;
-     *   - maior atraso.
-     */
-    explicit PendulumVelocity(
-        float filterTauSeconds = 0.030F
-    );
 
-    /**
-     * Inicializa o estimador com a posição atual.
-     */
-    void begin(
-        float initialPositionRad,
-        uint32_t initialTimeUs
-    );
+    // Janela adotada experimentalmente.
+    static constexpr uint8_t WINDOW_SIZE = 7;
 
-    /**
-     * Atualiza a velocidade usando:
-     *
-     * velocidade = variação da posição / variação do tempo
-     *
-     * Retorna true quando a atualização foi válida.
-     */
-    bool update(
-        float positionRad,
-        uint32_t currentTimeUs
-    );
+    PendulumVelocity();
 
-    /**
-     * Reinicia o estimador.
-     *
-     * Deve ser usado após alterações de estado,
-     * calibrações ou pausas longas.
-     */
+    // Reinicia completamente o estimador.
+    //
+    // Deve ser chamado quando beta = 0 for redefinido
+    // ou quando iniciarmos uma nova aquisição.
     void reset(
-        float currentPositionRad,
-        uint32_t currentTimeUs
+        float betaRadians,
+        uint32_t timeMicroseconds
     );
 
-    void setFilterTau(float filterTauSeconds);
+    // Insere uma nova posição angular e atualiza beta_dot.
+    //
+    // Retorna true quando a janela completa de 7 amostras
+    // já está disponível.
+    bool update(
+        float betaRadians,
+        uint32_t timeMicroseconds
+    );
 
-    float rawVelocityRadS() const;
-    float filteredVelocityRadS() const;
+    // Velocidade estimada por regressão linear [rad/s].
+    float radiansPerSecond() const;
 
-    float sampleTimeSeconds() const;
+    // Período real entre as duas últimas aquisições [s].
+    float samplePeriodSeconds() const;
 
-    bool isInitialized() const;
+    // Indica se já existem 7 amostras válidas.
+    bool isReady() const;
+
 
 private:
-    float filterTauSeconds_;
 
-    bool initialized_ = false;
-    bool filterInitialized_ = false;
+    // Coloca um ângulo no intervalo [-PI, +PI).
+    static float wrapToPi(float angle);
 
-    float previousPositionRad_ = 0.0F;
-    uint32_t previousTimeUs_ = 0;
+    // Converte beta circular em uma posição angular contínua.
+    float unwrap(float betaRadians);
 
-    float rawVelocityRadS_ = 0.0F;
-    float filteredVelocityRadS_ = 0.0F;
+    // Insere nova amostra na janela.
+    void insertSample(
+        float continuousBeta,
+        uint32_t timeMicroseconds
+    );
 
-    float sampleTimeSeconds_ = 0.0F;
+    // Calcula a inclinação da reta beta(t).
+    void calculateRegression();
 
-    /*
-     * Evita considerar imediatamente as primeiras
-     * amostras após a inicialização.
-     */
-    uint8_t warmupSamplesRemaining_ = 0;
 
-    static constexpr uint8_t WARMUP_SAMPLES = 3;
+    // --------------------------------------------------------
+    // Janela de regressão
+    // --------------------------------------------------------
+
+    float betaBuffer_[WINDOW_SIZE];
+    uint32_t timeBuffer_[WINDOW_SIZE];
+
+    uint8_t sampleCount_;
+
+
+    // --------------------------------------------------------
+    // Unwrap
+    // --------------------------------------------------------
+
+    float previousWrappedBeta_;
+    float continuousBeta_;
+
+    bool unwrapInitialized_;
+
+
+    // --------------------------------------------------------
+    // Resultado
+    // --------------------------------------------------------
+
+    float velocityRadiansPerSecond_;
+    float samplePeriodSeconds_;
+
+    uint32_t previousTimeMicroseconds_;
+
+    bool initialized_;
 };
-
-#endif

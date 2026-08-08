@@ -1,207 +1,198 @@
 #include "PendulumPosition.h"
 
-bool PendulumPosition::begin(
-    uint32_t i2cClockHz,
-    uint8_t direction
+
+PendulumPosition::PendulumPosition(
+    AS5600 &sensor,
+    float directionSign
 )
+    : sensor_(sensor),
+      directionSign_(directionSign),
+      raw_(0),
+      topRaw_(0),
+      absoluteAngleRadians_(0.0F),
+      betaRadians_(0.0F),
+      topDefined_(false),
+      lastError_(AS5600_OK)
 {
-    Wire.begin();
-    Wire.setClock(i2cClockHz);
-
-    /*
-     * begin() sem parâmetro:
-     *
-     * - não utiliza um pino Arduino para controlar DIR;
-     * - a direção pode ser definida por software;
-     * - evita conflito com o D4 usado pelo ENABLE do A4988.
-     */
-    sensor_.begin();
-    sensor_.setDirection(direction);
-
-    delay(20);
-
-    connected_ = sensor_.isConnected();
-
-    if (!connected_) {
-        return false;
-    }
-
-    /*
-     * readAngle() realiza a leitura I2C.
-     *
-     * getCumulativePosition(false) reutiliza a mesma
-     * amostra, evitando uma segunda leitura do sensor.
-     */
-    rawAngle_ = sensor_.readAngle();
-
-    cumulativeCounts_ =
-        sensor_.getCumulativePosition(false);
-
-    continuousAngleRad_ =
-        static_cast<float>(cumulativeCounts_) *
-        RAD_PER_COUNT;
-
-    updateDerivedAngles();
-
-    return true;
 }
+
+
+bool PendulumPosition::begin()
+{
+    sensor_.begin();
+
+    return sensor_.isConnected();
+}
+
 
 bool PendulumPosition::update()
 {
-    if (!connected_) {
+    // readAngle() retorna 0 ... 4095.
+    raw_ = sensor_.readAngle();
+
+    lastError_ = sensor_.lastError();
+
+    if (lastError_ != AS5600_OK)
+    {
         return false;
     }
 
-    /*
-     * Uma única leitura física do AS5600.
-     */
-    rawAngle_ = sensor_.readAngle();
+    absoluteAngleRadians_ =
+        static_cast<float>(raw_) * AS5600_RAW_TO_RADIANS;
 
-    /*
-     * false informa à biblioteca que deve reutilizar
-     * o valor obtido por readAngle().
-     */
-    cumulativeCounts_ =
-        sensor_.getCumulativePosition(false);
+    if (topDefined_)
+    {
+        const int16_t delta =
+            circularDifference(raw_, topRaw_);
 
-    continuousAngleRad_ =
-        static_cast<float>(cumulativeCounts_) *
-        RAD_PER_COUNT;
-
-    updateDerivedAngles();
+        betaRadians_ =
+            directionSign_ *
+            static_cast<float>(delta) *
+            AS5600_RAW_TO_RADIANS;
+    }
 
     return true;
 }
 
-void PendulumPosition::defineLowerReference()
+
+bool PendulumPosition::calibrateTop(
+    uint8_t numberOfSamples,
+    uint16_t intervalMilliseconds
+)
 {
-    /*
-     * A posição contínua atual passa a representar
-     * o ponto inferior do pêndulo.
-     */
-    lowerReferenceContinuousRad_ =
-        continuousAngleRad_;
-
-    referenceDefined_ = true;
-
-    updateDerivedAngles();
-}
-
-void PendulumPosition::updateDerivedAngles()
-{
-    if (!referenceDefined_) {
-        angleFromLowerUnwrappedRad_ = 0.0F;
-        angleFromLowerWrappedRad_ = 0.0F;
-        equilibriumErrorRad_ = 0.0F;
-
-        return;
+    if (numberOfSamples == 0)
+    {
+        return false;
     }
 
-    angleFromLowerUnwrappedRad_ =
-        continuousAngleRad_ -
-        lowerReferenceContinuousRad_;
+    // Primeira leitura servirá como referência.
+    uint16_t reference = sensor_.readAngle();
 
-    angleFromLowerWrappedRad_ =
-        wrapToTwoPi(
-            angleFromLowerUnwrappedRad_
-        );
+    lastError_ = sensor_.lastError();
 
-    /*
-     * A posição vertical fica PI radianos distante
-     * da posição inferior.
-     *
-     * Portanto:
-     *
-     * erro = alpha - PI
-     */
-    equilibriumErrorRad_ =
-        wrapToPi(
-            angleFromLowerUnwrappedRad_ - PI
-        );
-}
-
-float PendulumPosition::wrapToPi(float angle)
-{
-    while (angle >= PI) {
-        angle -= TWO_PI;
+    if (lastError_ != AS5600_OK)
+    {
+        return false;
     }
 
-    while (angle < -PI) {
-        angle += TWO_PI;
+    int32_t accumulatedDifference = 0;
+
+    for (uint8_t i = 0; i < numberOfSamples; ++i)
+    {
+        uint16_t value = sensor_.readAngle();
+
+        lastError_ = sensor_.lastError();
+
+        if (lastError_ != AS5600_OK)
+        {
+            return false;
+        }
+
+        accumulatedDifference +=
+            circularDifference(value, reference);
+
+        delay(intervalMilliseconds);
     }
 
-    return angle;
-}
+    const int32_t meanDifference =
+        accumulatedDifference /
+        static_cast<int32_t>(numberOfSamples);
 
-float PendulumPosition::wrapToTwoPi(float angle)
-{
-    while (angle >= TWO_PI) {
-        angle -= TWO_PI;
+    int32_t calculatedTop =
+        static_cast<int32_t>(reference) +
+        meanDifference;
+
+    // Coloca novamente no intervalo 0 ... 4095.
+    while (calculatedTop < 0)
+    {
+        calculatedTop += 4096;
     }
 
-    while (angle < 0.0F) {
-        angle += TWO_PI;
+    while (calculatedTop >= 4096)
+    {
+        calculatedTop -= 4096;
     }
 
-    return angle;
+    topRaw_ = static_cast<uint16_t>(calculatedTop);
+
+    topDefined_ = true;
+
+    // Atualiza beta usando a nova referência.
+    return update();
 }
 
-bool PendulumPosition::isConnected() const
+
+bool PendulumPosition::topIsDefined() const
 {
-    return connected_;
+    return topDefined_;
 }
 
-bool PendulumPosition::isReferenceDefined() const
+
+uint16_t PendulumPosition::raw() const
 {
-    return referenceDefined_;
+    return raw_;
 }
+
+
+float PendulumPosition::absoluteAngleRadians() const
+{
+    return absoluteAngleRadians_;
+}
+
+
+float PendulumPosition::betaRadians() const
+{
+    return betaRadians_;
+}
+
+
+uint16_t PendulumPosition::topRaw() const
+{
+    return topRaw_;
+}
+
+
+int PendulumPosition::lastError() const
+{
+    return lastError_;
+}
+
 
 bool PendulumPosition::magnetDetected()
 {
     return sensor_.magnetDetected();
 }
 
+
 bool PendulumPosition::magnetTooWeak()
 {
     return sensor_.magnetTooWeak();
 }
+
 
 bool PendulumPosition::magnetTooStrong()
 {
     return sensor_.magnetTooStrong();
 }
 
-uint16_t PendulumPosition::magneticMagnitude()
-{
-    return sensor_.readMagnitude();
-}
 
-uint16_t PendulumPosition::rawAngle() const
+int16_t PendulumPosition::circularDifference(
+    uint16_t current,
+    uint16_t reference
+)
 {
-    return rawAngle_;
-}
+    int16_t difference =
+        static_cast<int16_t>(current) -
+        static_cast<int16_t>(reference);
 
-int32_t PendulumPosition::cumulativeCounts() const
-{
-    return cumulativeCounts_;
-}
+    if (difference > 2048)
+    {
+        difference -= 4096;
+    }
+    else if (difference < -2048)
+    {
+        difference += 4096;
+    }
 
-float PendulumPosition::continuousAngleRad() const
-{
-    return continuousAngleRad_;
-}
-
-float PendulumPosition::angleFromLowerUnwrappedRad() const
-{
-    return angleFromLowerUnwrappedRad_;
-}
-
-float PendulumPosition::angleFromLowerWrappedRad() const
-{
-    return angleFromLowerWrappedRad_;
-}
-
-float PendulumPosition::equilibriumErrorRad() const
-{
-    return equilibriumErrorRad_;
+    return difference;
 }
