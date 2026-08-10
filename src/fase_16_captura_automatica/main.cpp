@@ -1230,7 +1230,15 @@ void serviceEnergyPhase(uint32_t nowUs, float dtSeconds, uint32_t dtUs)
     checkTopCross(nowUs);
     if (!isEnergyPhase()) return;
 
-    float energyError = cfg16::energyReference - energyHeld;
+    // SWING_UP continua perseguindo EREF=1.10.
+    // PRECAPTURE passa a perseguir apenas a energia do topo (1.00),
+    // reduzindo o bombeamento quando o pendulo ja esta perto da vertical.
+    const float targetEnergy =
+        phase == Phase::PRECAPTURE
+            ? 1.00F
+            : cfg16::energyReference;
+
+    float energyError = targetEnergy - energyHeld;
     if (energyError < 0.0F) energyError = 0.0F;
 
     phaseSignal =
@@ -1812,7 +1820,7 @@ void setup()
     nextControlTimeUs = lastControlTimeUs + FurutaConfig::CONTROL_PERIOD_US;
 
     Serial.println();
-    Serial.println(F("F16.1 LOWFLASH"));
+    Serial.println(F("F16.2 PRE E1.00"));
     Serial.println(F("K2+RS"));
     printConfig();
 }
