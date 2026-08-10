@@ -50,6 +50,8 @@ namespace cfg16
     float energyReference = 1.10F;
 
     // PreCapture.
+    float preCaptureEnergyReference = 1.03F;
+    float preCaptureTaperStartEnergy = 0.980F;
     float preCaptureEntryDeg = 22.0F;
     float preCaptureEnergyMaxDegS2 = 95.0F;
     constexpr float PREENTRY_MIN_DEG = 10.0F;
@@ -63,6 +65,15 @@ namespace cfg16
     constexpr float U_ARM_MAX_DEG_S2 = 150.0F;
     constexpr float ARM_CENTER_BAND_DEG = 3.0F;
     constexpr float ARM_SWING_ABORT_DEG = 60.0F;
+
+    // PREARM:
+    // 0 = comportamento antigo no PRECAPTURE
+    // 1 = no PRECAPTURE, termo D do braco so atua quando
+    //     |phi| > PREBAND E o braco esta se afastando.
+    uint8_t preArmMode = 1;
+    float preArmBandDeg = 3.0F;
+    constexpr float PREARM_BAND_MIN_DEG = 3.0F;
+    constexpr float PREARM_BAND_MAX_DEG = 15.0F;
 
     // --------------------------------------------------------
     // KICK AUTOMATICO
@@ -116,6 +127,7 @@ namespace cfg16
     constexpr uint8_t MAX_CYCLES = 60;
     constexpr uint8_t STALL_CYCLES = 3;
     constexpr uint32_t ENERGY_TIMEOUT_US = 80000000UL;
+    constexpr uint32_t PRECAPTURE_TIMEOUT_US = 12000000UL;
 
     // --------------------------------------------------------
     // GATE DE CAPTURA
@@ -274,6 +286,7 @@ int8_t syncPeakArm = 0;
 float syncPeakCandidateAlphaRad = 0.0F;
 
 uint32_t energyStartUs = 0;
+uint32_t preCaptureStartUs = 0;
 uint32_t captureStartUs = 0;
 uint32_t captureStableStartUs = 0;
 uint32_t balanceStartUs = 0;
@@ -282,12 +295,6 @@ uint32_t nextLocalTelemetryUs = 0;
 // Estatisticas essenciais.
 struct Statistics
 {
-    float kickMaxPhiDeg;
-    float kickMaxPhiDotDegS;
-
-    float syncMaxAlphaDeg;
-    float syncMaxAlphaDotRadS;
-
     float maxAbsAlphaDeg;
     float maxAbsPhiEnergyDeg;
     float maxAbsPhiDotEnergyDegS;
@@ -430,6 +437,7 @@ void resetRun()
     consecutiveNonPositiveCycles = 0;
 
     previousBetaValid = false;
+    preCaptureStartUs = 0;
     captureStableStartUs = 0;
 
     syncPeakArm = 0;
@@ -441,47 +449,30 @@ void resetRun()
 
 void printConfig()
 {
-    // Telemetria compactada para economizar FLASH.
     Serial.println();
     Serial.println(F("#CFG"));
 
-    Serial.print(F("K="));
-    Serial.print(cfg16::kickAccelDegS2, 0);
-    Serial.print(',');
-    Serial.print(cfg16::kickStageMs);
-    Serial.print(',');
-    Serial.println(cfg16::kickSign);
-
-    Serial.print(F("S="));
-    Serial.print(cfg16::SYNC_ARM_SPEED_RAD_S, 2);
-    Serial.print(',');
-    Serial.print(cfg16::SYNC_REVERSE_SPEED_RAD_S, 2);
-    Serial.print(',');
-    Serial.println(cfg16::SYNC_PEAK_ACCEPT_ANGLE_DEG, 1);
-
     Serial.print(F("E="));
-    Serial.println(cfg16::energyReference, 2);
+    Serial.print(cfg16::energyReference, 2);
+    Serial.print(',');
+    Serial.print(cfg16::preCaptureEnergyReference, 2);
+    Serial.print(',');
+    Serial.println(cfg16::preCaptureTaperStartEnergy, 3);
 
     Serial.print(F("P="));
     Serial.print(cfg16::preCaptureEntryDeg, 1);
     Serial.print(',');
     Serial.println(cfg16::preCaptureEnergyMaxDegS2, 0);
 
-    Serial.print(F("C="));
-    Serial.println(cfg16::captureEntryDeg, 1);
+    Serial.print(F("A="));
+    Serial.print(cfg16::preArmMode);
+    Serial.print(',');
+    Serial.println(cfg16::preArmBandDeg, 1);
 }
 
 // ============================================================
 // ESTATISTICAS
 // ============================================================
-
-void updateKickStatistics()
-{
-    const float p = fabsf(motor.currentPositionDegrees());
-    const float pd = fabsf(motor.speedReferenceDegreesPerSecond());
-    if (p > stats.kickMaxPhiDeg) stats.kickMaxPhiDeg = p;
-    if (pd > stats.kickMaxPhiDotDegS) stats.kickMaxPhiDotDegS = pd;
-}
 
 void updateEnergyStatistics()
 {
@@ -527,16 +518,6 @@ void printResult(FinishReason reason)
 
     Serial.print(F("#cy="));
     Serial.println(fullCycleCount);
-
-    Serial.print(F("#k="));
-    Serial.print(stats.kickMaxPhiDeg, 2);
-    Serial.print(',');
-    Serial.println(stats.kickMaxPhiDotDegS, 2);
-
-    Serial.print(F("#s="));
-    Serial.print(stats.syncMaxAlphaDeg, 2);
-    Serial.print(',');
-    Serial.println(stats.syncMaxAlphaDotRadS, 4);
 
     Serial.print(F("#e="));
     Serial.print(stats.maxAbsAlphaDeg, 2);
@@ -675,7 +656,6 @@ void serviceKick(uint32_t nowUs, float dtSeconds, uint32_t dtUs)
         return;
     }
 
-    updateKickStatistics();
 }
 
 // ============================================================
@@ -763,19 +743,6 @@ void serviceSync(uint32_t nowUs)
     }
 
     // Mede explicitamente quanto o KICK transferiu ao pendulo.
-    const float absAlphaDeg = fabsf(alphaRad * RAD_TO_DEG);
-    const float absAlphaDot = fabsf(alphaDotRadS);
-
-    if (absAlphaDeg > stats.syncMaxAlphaDeg)
-    {
-        stats.syncMaxAlphaDeg = absAlphaDeg;
-    }
-
-    if (absAlphaDot > stats.syncMaxAlphaDotRadS)
-    {
-        stats.syncMaxAlphaDotRadS = absAlphaDot;
-    }
-
     // Telemetria lenta somente no SYNC.
     if (static_cast<int32_t>(nowUs - nextSyncTelemetryUs) >= 0)
     {
@@ -902,9 +869,26 @@ float computeSwingArmControl(float phiDeg, float phiDotDegS)
 
     float command = -cfg16::K_PHI_SWING * phiDeg;
 
-    if (movingAway || nearCenter)
+    if (phase == Phase::PRECAPTURE && cfg16::preArmMode == 1)
     {
-        command -= cfg16::K_DPHI_SWING * phiDotDegS;
+        const bool nearPreCenter = fabsf(phiDeg) <= cfg16::preArmBandDeg;
+
+        // PRECAPTURE experimental:
+        // dentro de PREBAND nao usa D; fora dela, usa D somente
+        // quando o braco esta se afastando do zero.
+        if (movingAway && !nearPreCenter)
+        {
+            command -= cfg16::K_DPHI_SWING * phiDotDegS;
+        }
+    }
+    else
+    {
+        // SWING_UP continua usando a banda original de 3 graus.
+        // PREARM=0 reproduz o comportamento antigo.
+        if (movingAway || nearCenter)
+        {
+            command -= cfg16::K_DPHI_SWING * phiDotDegS;
+        }
     }
 
     return clampFloat(
@@ -914,9 +898,10 @@ float computeSwingArmControl(float phiDeg, float phiDotDegS)
     );
 }
 
-void enterPreCapture(float peakBetaDeg, float ePeak)
+void enterPreCapture(float peakBetaDeg, float ePeak, uint32_t nowUs)
 {
     phase = Phase::PRECAPTURE;
+    preCaptureStartUs = nowUs;
     consecutiveNonPositiveCycles = 0;
 
     Serial.print(F("#PC,b="));
@@ -1109,17 +1094,19 @@ void handleEnergyPeak(const PendulumEvent &event, uint32_t nowUs)
         && topDistanceDeg <= cfg16::preCaptureEntryDeg
     )
     {
-        enterPreCapture(peakBetaDeg, ePeak);
+        enterPreCapture(peakBetaDeg, ePeak, nowUs);
         return;
     }
 
-    if (consecutiveNonPositiveCycles >= cfg16::STALL_CYCLES)
+    // "Energia nao crescente por 3 ciclos" continua sendo criterio
+    // de stall somente no SWING_UP. Em PRECAPTURE a energia pode cair
+    // deliberadamente; portanto esse criterio seria incorreto.
+    if (
+        phase == Phase::SWING_UP
+        && consecutiveNonPositiveCycles >= cfg16::STALL_CYCLES
+    )
     {
-        finishRun(
-            phase == Phase::PRECAPTURE
-                ? FinishReason::PRECAPTURE_STALLED
-                : FinishReason::SWING_STALLED
-        );
+        finishRun(FinishReason::SWING_STALLED);
         return;
     }
 
@@ -1203,6 +1190,15 @@ void serviceEnergyPhase(uint32_t nowUs, float dtSeconds, uint32_t dtUs)
         return;
     }
 
+    if (
+        phase == Phase::PRECAPTURE
+        && (nowUs - preCaptureStartUs) >= cfg16::PRECAPTURE_TIMEOUT_US
+    )
+    {
+        finishRun(FinishReason::PRECAPTURE_STALLED);
+        return;
+    }
+
     const float phiDeg = motor.currentPositionDegrees();
     const float phiDotDegS = motor.speedReferenceDegreesPerSecond();
 
@@ -1230,13 +1226,28 @@ void serviceEnergyPhase(uint32_t nowUs, float dtSeconds, uint32_t dtUs)
     checkTopCross(nowUs);
     if (!isEnergyPhase()) return;
 
-    // SWING_UP continua perseguindo EREF=1.10.
-    // PRECAPTURE passa a perseguir apenas a energia do topo (1.00),
-    // reduzindo o bombeamento quando o pendulo ja esta perto da vertical.
-    const float targetEnergy =
-        phase == Phase::PRECAPTURE
-            ? 1.00F
-            : cfg16::energyReference;
+    float targetEnergy = cfg16::energyReference;
+
+    if (phase == Phase::PRECAPTURE)
+    {
+        const float e0 = cfg16::preCaptureTaperStartEnergy;
+
+        if (energyHeld <= e0)
+        {
+            targetEnergy = cfg16::preCaptureEnergyReference;
+        }
+        else if (energyHeld >= 1.0F)
+        {
+            targetEnergy = 1.0F;
+        }
+        else
+        {
+            const float r = (1.0F - energyHeld) / (1.0F - e0);
+            targetEnergy =
+                1.0F
+                + (cfg16::preCaptureEnergyReference - 1.0F) * r;
+        }
+    }
 
     float energyError = targetEnergy - energyHeld;
     if (energyError < 0.0F) energyError = 0.0F;
@@ -1500,6 +1511,47 @@ bool setParameter(const char *name, const char *valueText)
     {
         if (value < 0.90F || value > 1.20F) { Serial.println(F("REJECT")); return false; }
         cfg16::energyReference = value;
+        Serial.println(F("OK"));
+        return true;
+    }
+
+    if (strcmp_P(name, PSTR("EPRE")) == 0)
+    {
+        if (value < 1.00F || value > 1.10F) { Serial.println(F("REJECT")); return false; }
+        cfg16::preCaptureEnergyReference = value;
+        Serial.println(F("OK"));
+        return true;
+    }
+
+    if (strcmp_P(name, PSTR("ETAPER")) == 0)
+    {
+        if (value < 0.950F || value > 0.995F)
+        {
+            Serial.println(F("REJECT"));
+            return false;
+        }
+        cfg16::preCaptureTaperStartEnergy = value;
+        Serial.println(F("OK"));
+        return true;
+    }
+
+    if (strcmp_P(name, PSTR("PREARM")) == 0)
+    {
+        if (value >= -0.1F && value < 0.5F) cfg16::preArmMode = 0;
+        else if (value >= 0.5F && value <= 1.1F) cfg16::preArmMode = 1;
+        else { Serial.println(F("REJECT")); return false; }
+        Serial.println(F("OK"));
+        return true;
+    }
+
+    if (strcmp_P(name, PSTR("PREBAND")) == 0)
+    {
+        if (value < cfg16::PREARM_BAND_MIN_DEG || value > cfg16::PREARM_BAND_MAX_DEG)
+        {
+            Serial.println(F("REJECT"));
+            return false;
+        }
+        cfg16::preArmBandDeg = value;
         Serial.println(F("OK"));
         return true;
     }
@@ -1820,8 +1872,7 @@ void setup()
     nextControlTimeUs = lastControlTimeUs + FurutaConfig::CONTROL_PERIOD_US;
 
     Serial.println();
-    Serial.println(F("F16.2 PRE E1.00"));
-    Serial.println(F("K2+RS"));
+    Serial.println(F("F16.7T LF"));
     printConfig();
 }
 
