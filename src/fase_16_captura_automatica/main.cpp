@@ -50,9 +50,11 @@ namespace cfg16
     float energyReference = 1.10F;
 
     // PreCapture.
-    float preCaptureEnergyReference = 1.03F;
-    float preCaptureTaperStartEnergy = 0.980F;
-    float preCaptureEntryDeg = 22.0F;
+    // Defaults F16.9:
+    // EPRE=1.05, ETAPER=0.998, PREENTRY=30 deg, UPRECAP=95 deg/s2.
+    float preCaptureEnergyReference = 1.05F;
+    float preCaptureTaperStartEnergy = 0.998F;
+    float preCaptureEntryDeg = 30.0F;
     float preCaptureEnergyMaxDegS2 = 95.0F;
     constexpr float PREENTRY_MIN_DEG = 10.0F;
     constexpr float PREENTRY_MAX_DEG = 40.0F;
@@ -70,8 +72,9 @@ namespace cfg16
     // 0 = comportamento antigo no PRECAPTURE
     // 1 = no PRECAPTURE, termo D do braco so atua quando
     //     |phi| > PREBAND E o braco esta se afastando.
+    // Defaults F16.9: PREARM=1, PREBAND=8 deg.
     uint8_t preArmMode = 1;
-    float preArmBandDeg = 3.0F;
+    float preArmBandDeg = 8.0F;
     constexpr float PREARM_BAND_MIN_DEG = 3.0F;
     constexpr float PREARM_BAND_MAX_DEG = 15.0F;
 
@@ -138,14 +141,15 @@ namespace cfg16
     constexpr float CAPENTRY_MAX_DEG = 2.0F;
 
     constexpr float CAPTURE_GATE_BETA_DOT_RAD_S = 0.25F;
-    constexpr float CAPTURE_GATE_PHI_DEG = 5.0F;
+    constexpr float CAPTURE_SAFE_PHI_ABS_DEG = 15.0F;
     constexpr float CAPTURE_GATE_PHI_DOT_DEG_S = 45.0F;
+    constexpr float CAPTURE_GATE_UPRED_DEG_S2 = 300.0F;
 
     // Cruzamento direto do TOP: ainda mais estrito em beta.
     constexpr float DIRECT_CAPTURE_BETA_DEG = 1.0F;
     constexpr float TOP_CROSS_GUARD_DEG = 10.0F;
 
-    // CAPTURE_LOCK — criterio do controlador vertical antigo.
+    // CAPTURE_LOCK — phi aqui e relativo a phi_ref.
     constexpr float CAPTURE_READY_BETA_DEG = 1.5F;
     constexpr float CAPTURE_READY_BETA_RAD =
         CAPTURE_READY_BETA_DEG * DEG_TO_RAD;
@@ -250,6 +254,10 @@ float alphaDotRadS = 0.0F;
 
 StateVector state{0.0F, 0.0F, 0.0F, 0.0F};
 ControlSignal localControl{0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, false};
+
+// Referência local do braço.
+// A posição interna do motor permanece absoluta.
+float phiReferenceDeg = 0.0F;
 
 // Energia.
 float energyHeld = 0.0F;
@@ -407,7 +415,18 @@ bool acquireState(uint32_t nowUs)
 
     state.beta = wrapToPi(alphaRad - cfg16::PI_F);
     state.betaDot = alphaDotRadS;
-    state.phi = motor.currentPositionDegrees() * DEG_TO_RAD;
+
+    const float phiAbsDeg = motor.currentPositionDegrees();
+
+    if (phase == Phase::CAPTURE || phase == Phase::BALANCE)
+    {
+        state.phi = (phiAbsDeg - phiReferenceDeg) * DEG_TO_RAD;
+    }
+    else
+    {
+        state.phi = phiAbsDeg * DEG_TO_RAD;
+    }
+
     state.phiDot = motor.speedReferenceDegreesPerSecond() * DEG_TO_RAD;
 
     return true;
@@ -421,6 +440,7 @@ void resetRun()
 {
     stats = {};
     captureSnapshot = {};
+    phiReferenceDeg = 0.0F;
 
     energyHeld = 0.0F;
     phaseSignal = 0.0F;
@@ -922,15 +942,17 @@ float predictedRawControlDegS2(const StateVector &candidate)
 bool captureGateOK(
     float betaDeg,
     float betaDotRadS,
-    float phiDeg,
-    float phiDotDegS
+    float phiAbsDeg,
+    float phiDotDegS,
+    float uPredDegS2
 )
 {
     return
         fabsf(betaDeg) <= cfg16::captureEntryDeg
         && fabsf(betaDotRadS) <= cfg16::CAPTURE_GATE_BETA_DOT_RAD_S
-        && fabsf(phiDeg) <= cfg16::CAPTURE_GATE_PHI_DEG
-        && fabsf(phiDotDegS) <= cfg16::CAPTURE_GATE_PHI_DOT_DEG_S;
+        && fabsf(phiAbsDeg) <= cfg16::CAPTURE_SAFE_PHI_ABS_DEG
+        && fabsf(phiDotDegS) <= cfg16::CAPTURE_GATE_PHI_DOT_DEG_S
+        && fabsf(uPredDegS2) <= cfg16::CAPTURE_GATE_UPRED_DEG_S2;
 }
 
 void enterCapture(
@@ -944,12 +966,19 @@ void enterCapture(
     captureStableStartUs = 0;
     nextLocalTelemetryUs = nowUs;
 
+    const float phiAbsDeg = motor.currentPositionDegrees();
+
     captureSnapshot.valid = true;
     captureSnapshot.betaDeg = state.beta * RAD_TO_DEG;
     captureSnapshot.betaDotRadS = state.betaDot;
-    captureSnapshot.phiDeg = state.phi * RAD_TO_DEG;
+    captureSnapshot.phiDeg = phiAbsDeg;
     captureSnapshot.phiDotDegS = state.phiDot * RAD_TO_DEG;
     captureSnapshot.predictedRawDegS2 = predictedRawDegS2;
+
+    // Novo centro do controlador vertical.
+    // NÃO altera a posição interna do motor.
+    phiReferenceDeg = phiAbsDeg;
+    state.phi = 0.0F;
 
     Serial.print(F("#CE,"));
     Serial.print(source);
@@ -1063,8 +1092,9 @@ void handleEnergyPeak(const PendulumEvent &event, uint32_t nowUs)
         StateVector candidate = state;
         candidate.beta = peakBetaRad;
         candidate.betaDot = 0.0F;
+        candidate.phi = 0.0F;
 
-        const float phiDeg = state.phi * RAD_TO_DEG;
+        const float phiDeg = motor.currentPositionDegrees();
         const float phiDotDegS = state.phiDot * RAD_TO_DEG;
         const float uPred = predictedRawControlDegS2(candidate);
 
@@ -1072,7 +1102,8 @@ void handleEnergyPeak(const PendulumEvent &event, uint32_t nowUs)
                 peakBetaDeg,
                 state.betaDot,
                 phiDeg,
-                phiDotDegS
+                phiDotDegS,
+                uPred
             ))
         {
             enterCapture('P', nowUs, uPred);
@@ -1137,9 +1168,12 @@ void checkTopCross(uint32_t nowUs)
         if (crossed && nearTop)
         {
             const float betaDeg = state.beta * RAD_TO_DEG;
-            const float phiDeg = state.phi * RAD_TO_DEG;
+            const float phiDeg = motor.currentPositionDegrees();
             const float phiDotDegS = state.phiDot * RAD_TO_DEG;
-            const float uPred = predictedRawControlDegS2(state);
+
+            StateVector candidate = state;
+            candidate.phi = 0.0F;
+            const float uPred = predictedRawControlDegS2(candidate);
 
             const bool betaDirectOK =
                 fabsf(betaDeg) <= cfg16::DIRECT_CAPTURE_BETA_DEG;
@@ -1150,7 +1184,8 @@ void checkTopCross(uint32_t nowUs)
                     betaDeg,
                     state.betaDot,
                     phiDeg,
-                    phiDotDegS
+                    phiDotDegS,
+                    uPred
                 )
             )
             {
@@ -1346,7 +1381,7 @@ void serviceLocalControl(uint32_t nowUs, float dtSeconds, uint32_t dtUs)
         return;
     }
 
-    if (fabsf(state.phi * RAD_TO_DEG) >= cfg16::ARM_LOCAL_ABORT_DEG)
+    if (fabsf(motor.currentPositionDegrees()) >= cfg16::ARM_LOCAL_ABORT_DEG)
     {
         finishRun(FinishReason::ARM_LIMIT);
         return;
@@ -1525,7 +1560,7 @@ bool setParameter(const char *name, const char *valueText)
 
     if (strcmp_P(name, PSTR("ETAPER")) == 0)
     {
-        if (value < 0.950F || value > 0.995F)
+        if (value < 0.950F || value > 0.999F)
         {
             Serial.println(F("REJECT"));
             return false;
@@ -1872,7 +1907,7 @@ void setup()
     nextControlTimeUs = lastControlTimeUs + FurutaConfig::CONTROL_PERIOD_US;
 
     Serial.println();
-    Serial.println(F("F16.7T LF"));
+    Serial.println(F("F16.9 PR LF"));
     printConfig();
 }
 
