@@ -23,16 +23,16 @@ const RevisionSettings SETTINGS = {
     // Referencia vertical
     -1.0F, // TOP_REFERENCE_OFFSET_DEG
 
-    // CAPTURA
-    5.0F,     // phi max [deg]
-    0.80F,    // beta max [deg]       antes: 0.40
-    0.15F,    // betaDot max [rad/s]  antes: 0.10
-    100000UL, // estabilidade [us]    antes: 150000
+    // CAPTURA — restaurada da fase_10_integracao_final
+    5.0F,    // phi max [deg]
+    1.50F,   // beta max [deg]
+    0.25F,   // betaDot max [rad/s]
+    80000UL, // estabilidade = 80 ms
 
-    // SOLTURA
-    1.80F, // beta max [deg]       antes: 1.20
-    0.15F, // betaDot soltura [rad/s]
-    2,     // amostras consecutivas
+    // SOLTURA — restaurada da fase_10_integracao_final
+    1.75F, // beta max antes de CAPTURE_LOST [deg]
+    0.05F, // betaDot para reconhecer soltura [rad/s]
+    1,     // uma amostra basta
 
     // Abort / duracao
     8.0F,       // BETA_ABORT_DEG
