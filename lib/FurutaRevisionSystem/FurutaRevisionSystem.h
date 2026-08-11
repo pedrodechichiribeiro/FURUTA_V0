@@ -23,14 +23,15 @@
 // Objetivo:
 // - preservar TODAS as bibliotecas existentes;
 // - preservar os ganhos e limites validados na Fase 09/10;
-// - tornar a referencia DOWN mais robusta;
+// - usar referencia DOWN fixa em RAW=2888, sem calibracao T no fluxo;
 // - permitir diagnostico do TOP com o motor desabilitado OU habilitado em HOLD;
 // - abortar/registrar falhas de leitura do AS5600;
 // - imprimir os parametros realmente compilados;
 // - manter ZERO telemetria Serial durante BALANCE;
-// - testar uma captura/soltura mais estrita sem alterar os ganhos;
+// - permitir ajuste dos ganhos em tempo de execucao pela Serial;
 // - corrigir o primeiro intervalo de 8 ms na entrada do BALANCE;
-// - registrar em RAM o inicio da resposta para diagnostico posterior.
+// - registrar continuamente em RAM a cauda da resposta para diagnostico posterior;
+// - medir medias de phi, beta e u para separar drift lento de chatter rapido.
 //
 // Nenhum arquivo em lib/ precisa ser alterado.
 // ============================================================
@@ -55,9 +56,15 @@ namespace RevisionConfig
 
     constexpr uint8_t MAX_CONSECUTIVE_SENSOR_ERRORS = 3;
 
-    // Trace em RAM. Mantido fixo para controlar o uso de SRAM do Nano.
-    constexpr uint8_t DEBUG_DECIMATION = 4;
-    constexpr uint8_t DEBUG_MAX_SAMPLES = 48;
+    // Trace circular em RAM.
+    // Ts=4 ms e decimacao 5 -> 20 ms = 50 Hz.
+    // 16 amostras -> ~0,32 s imediatamente ANTES do fim do BALANCE.
+    // Cada amostra = 8 bytes; buffer total = 128 bytes.
+    constexpr uint8_t DEBUG_DECIMATION = 5;
+    constexpr uint8_t DEBUG_MAX_SAMPLES = 16;
+
+    // Permite enviar os quatro ganhos em uma unica linha pela Serial.
+    constexpr uint8_t SERIAL_BUFFER_SIZE = 64;
 }
 
 // ============================================================
@@ -92,6 +99,10 @@ struct RevisionSettings
     float betaAbortDeg;
     float armAbortDeg;
     uint32_t balanceTestTimeUs;
+
+    // RAW DOWN fixo usado diretamente no calculo de beta.
+    uint16_t rawReferenceCounts;
+    bool rawHistoryEnabled;
 };
 
 class FurutaRevisionSystem
@@ -125,17 +136,22 @@ private:
         uint32_t sumControlDtUs;
         uint32_t maxTickExecUs;
         uint32_t missedScheduleSlots;
+
+        // Medias durante todo o BALANCE: uteis para diagnosticar bias/offset.
+        float sumPhiDeg;
+        float sumBetaDeg;
+        float sumControlDegS2;
     };
 
-    // Estado compactado para diagnostico do inicio da instabilidade.
-    // Os quatro termos de controle sao reconstruidos no dump a partir
-    // desses estados e dos mesmos ganhos congelados em FurutaConfig.
+    // Cauda compactada do BALANCE. Guardamos apenas o necessario para
+    // separar: (1) movimento do braco, (2) movimento do pendulo,
+    // (3) velocidade estimada e (4) comando aplicado.
     struct DebugSample
     {
-        int16_t phi1e4;
-        int16_t phiDot1e4;
-        int16_t beta1e5;
-        int16_t betaDot5e3;
+        int16_t phiCdeg;       // phi [deg] * 100
+        int16_t betaMdeg;      // beta [deg] * 1000
+        int16_t betaDot5e3;    // betaDot [rad/s] * 5000
+        int16_t uDegS2;        // u aplicado [deg/s2]
     };
 
     // Parametros definidos no main.cpp.
@@ -148,7 +164,6 @@ private:
     PendulumVelocity downVelocity_;
     PendulumDownReference downReference_;
     MotorVelocity motor_;
-    FourStateController controller_;
     BalanceTelemetry telemetry_;
 
     // Estado da aplicacao.
@@ -194,13 +209,14 @@ private:
     // Snapshot do inicio do BALANCE, guardado sem imprimir na soltura.
     StateVector balanceInitialState_;
 
-    // Trace em RAM: 48 x 8 = 384 bytes. Mantido pequeno para o ATmega328P.
+    // Trace circular em RAM: 16 x 8 = 128 bytes.
     DebugSample debugSamples_[RevisionConfig::DEBUG_MAX_SAMPLES];
     uint8_t debugSampleCount_;
+    uint8_t debugWriteIndex_;
     uint8_t debugDecimationCounter_;
 
     // Serial.
-    char serialBuffer_[FurutaConfig::SERIAL_BUFFER_SIZE];
+    char serialBuffer_[RevisionConfig::SERIAL_BUFFER_SIZE];
     uint8_t serialBufferIndex_;
 
     // Utilitarios angulares.
@@ -210,6 +226,7 @@ private:
     bool acquireState(uint32_t nowUs);
     float rawRelativeToDownAnchor() const;
     float betaFromRobustDownReference() const;
+    void applyFixedDownReference();
     void startDownCalibration();
     void serviceDownCalibration(uint32_t nowUs, bool sensorReadingValid);
     void finishDownCalibration();
@@ -227,6 +244,7 @@ private:
     void serviceWaitRelease(uint32_t nowUs);
     void startBalance(uint32_t nowUs);
     void serviceBalance(uint32_t nowUs, float dtSeconds, uint32_t dtUs);
+    ControlSignal computeRuntimeControl() const;
     void endBalance(const char *reason);
     void stopControl(bool printMessage = true);
 
@@ -248,12 +266,21 @@ private:
     void recordDebugTrace(uint32_t nowUs);
     void dumpDebugTrace();
 
+    // Historico persistente do RAW da calibracao DOWN (EEPROM).
+    void rawHistoryInit();
+    void rawHistoryAppend(uint16_t raw);
+    void printRawHistory();
+    uint16_t rawHistoryReadValue(uint8_t logicalIndex) const;
+
     // Serial.
     void serviceSerial();
     void handleCommand(char *command);
+    bool handleTuningCommand(char *command);
+    bool setSingleRuntimeParameter(const char *name, float value);
+    static bool parseOneFloat(const char *text, float &value);
+    static bool parseFourFloats(const char *text, float &a, float &b, float &c, float &d);
     void printParameters();
     void printStatus();
     void printHelp();
     void printBalanceSummary(const char *reason);
 };
-

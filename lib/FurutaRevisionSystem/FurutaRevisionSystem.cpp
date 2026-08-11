@@ -1,4 +1,19 @@
 #include "FurutaRevisionSystem.h"
+#include <EEPROM.h>
+
+namespace
+{
+    constexpr int RAW_EEPROM_BASE = 960;
+    constexpr uint8_t RAW_HISTORY_CAPACITY = 16;
+    constexpr uint8_t RAW_MAGIC = 0xA7;
+    constexpr uint8_t RAW_VERSION = 1;
+
+    constexpr int RAW_ADDR_MAGIC = RAW_EEPROM_BASE + 0;
+    constexpr int RAW_ADDR_VERSION = RAW_EEPROM_BASE + 1;
+    constexpr int RAW_ADDR_COUNT = RAW_EEPROM_BASE + 2;
+    constexpr int RAW_ADDR_NEXT = RAW_EEPROM_BASE + 3;
+    constexpr int RAW_ADDR_DATA = RAW_EEPROM_BASE + 4;
+}
 
 // ============================================================
 // CONSTRUTOR
@@ -23,13 +38,6 @@ FurutaRevisionSystem::FurutaRevisionSystem(const RevisionSettings &settings)
           FurutaConfig::ARM_MIN_DEG,
           FurutaConfig::ARM_MAX_DEG,
           false
-      ),
-      controller_(
-          settings.kPhi,
-          settings.kPhiDot,
-          settings.kBeta,
-          settings.kBetaDot,
-          settings.maxAccelDegS2 * FurutaConfig::DEG_TO_RAD_LOCAL
       ),
       telemetry_(FurutaConfig::TELEMETRY_PERIOD_US),
       controlState_(ControlState::IDLE),
@@ -63,6 +71,7 @@ FurutaRevisionSystem::FurutaRevisionSystem(const RevisionSettings &settings)
       nextTopDiagnosticUs_(0),
       balanceInitialState_{0.0F, 0.0F, 0.0F, 0.0F},
       debugSampleCount_(0),
+      debugWriteIndex_(0),
       debugDecimationCounter_(0),
       serialBufferIndex_(0)
 {
@@ -88,10 +97,15 @@ void FurutaRevisionSystem::begin()
     lastControlTimeUs_ = nowUs;
     nextControlTimeUs_ = nowUs + settings_.controlPeriodUs;
 
-    Serial.println(F("REV10-v13-MAINCFG"));
+    applyFixedDownReference();
+
+    Serial.println(F("REV10-v16-SERIAL"));
     Serial.print(F("AS5600=")); Serial.print(sensorConnected ? 1 : 0);
     Serial.print(F(",READ=")); Serial.print(firstReadOK ? 1 : 0);
     Serial.print(F(",MAG=")); Serial.println(pendulumPosition_.magnetDetected() ? 1 : 0);
+    rawHistoryInit();
+    Serial.print(F("DOWN,FIXED,RAW=")); Serial.print(settings_.rawReferenceCounts);
+    Serial.print(F(",OFF=")); Serial.println(settings_.topReferenceOffsetDeg, 3);
     printParameters();
     printHelp();
 }
@@ -195,6 +209,27 @@ float FurutaRevisionSystem::betaFromRobustDownReference() const
         - FurutaConfig::PI_LOCAL
         - topOffsetRad
     );
+}
+
+void FurutaRevisionSystem::applyFixedDownReference()
+{
+    // Equivalente a uma calibracao DOWN cujo valor medio absoluto fosse
+    // exatamente rawReferenceCounts. O offset interno de downReference_
+    // permanece zero; portanto downAnchorAbsoluteRad_ e a referencia efetiva.
+    downAnchorAbsoluteRad_ =
+        static_cast<float>(settings_.rawReferenceCounts & 0x0FFF)
+        * (FurutaConfig::TWO_PI_LOCAL / 4096.0F);
+
+    downReferenceDefined_ = true;
+    downCalibrationActive_ = false;
+    downCollecting_ = false;
+
+    if (pendulumPosition_.update())
+    {
+        state_.beta = betaFromRobustDownReference();
+        state_.betaDot = 0.0F;
+        pendulumVelocity_.reset(state_.beta, micros());
+    }
 }
 
 // ============================================================
@@ -402,6 +437,9 @@ void FurutaRevisionSystem::finishDownCalibration()
     Serial.print(F("T,OK,N=")); Serial.print(downCalibrationSamples_);
     Serial.print(F(",SPAN=")); Serial.print(downReference_.observedSpanDeg(), 3);
     Serial.print(F(",RAW=")); Serial.println(downRaw);
+
+    if (settings_.rawHistoryEnabled)
+        rawHistoryAppend(downRaw);
 }
 
 // ============================================================
@@ -811,8 +849,9 @@ void FurutaRevisionSystem::serviceBalance(
         return;
     }
 
-    // Lei de controle EXATAMENTE via biblioteca existente.
-    control_ = controller_.compute(state_);
+    // Mesma lei de quatro estados, agora calculada com os ganhos
+    // correntes de settings_, que podem ser alterados pela Serial em IDLE.
+    control_ = computeRuntimeControl();
 
     // Registra somente em RAM, de forma decimada. Nenhuma Serial aqui.
     recordDebugTrace(nowUs);
@@ -832,6 +871,37 @@ void FurutaRevisionSystem::serviceBalance(
     updateStatistics(dtUs);
 
     // V9: intencionalmente NENHUMA Serial aqui.
+}
+
+ControlSignal FurutaRevisionSystem::computeRuntimeControl() const
+{
+    ControlSignal signal;
+
+    signal.phiTermRadS2 = settings_.kPhi * state_.phi;
+    signal.phiDotTermRadS2 = settings_.kPhiDot * state_.phiDot;
+    signal.betaTermRadS2 = settings_.kBeta * state_.beta;
+    signal.betaDotTermRadS2 = settings_.kBetaDot * state_.betaDot;
+
+    signal.rawRadS2 =
+        signal.phiTermRadS2
+        + signal.phiDotTermRadS2
+        + signal.betaTermRadS2
+        + signal.betaDotTermRadS2;
+
+    const float limitRadS2 =
+        fabsf(settings_.maxAccelDegS2) * FurutaConfig::DEG_TO_RAD_LOCAL;
+
+    if (signal.rawRadS2 > limitRadS2)
+        signal.appliedRadS2 = limitRadS2;
+    else if (signal.rawRadS2 < -limitRadS2)
+        signal.appliedRadS2 = -limitRadS2;
+    else
+        signal.appliedRadS2 = signal.rawRadS2;
+
+    signal.saturated =
+        fabsf(signal.rawRadS2 - signal.appliedRadS2) > 0.0001F;
+
+    return signal;
 }
 
 void FurutaRevisionSystem::endBalance(const char *reason)
@@ -980,7 +1050,7 @@ void FurutaRevisionSystem::armBalance()
     releaseConfirmCount_ = 0;
     topDiagnosticActive_ = false;
 
-    Serial.println(F("B,ARMED,TIGHT_CAPTURE,TRACE_RAM"));
+    Serial.println(F("B,ARMED,BASE_CAPTURE,TAIL_RAM"));
 
     // Evita usar historico de betaDot de uma operacao anterior.
     state_.beta = betaFromRobustDownReference();
@@ -1040,6 +1110,9 @@ void FurutaRevisionSystem::resetStatistics()
     statistics_.sumControlDtUs = 0;
     statistics_.maxTickExecUs = 0;
     statistics_.missedScheduleSlots = 0;
+    statistics_.sumPhiDeg = 0.0F;
+    statistics_.sumBetaDeg = 0.0F;
+    statistics_.sumControlDegS2 = 0.0F;
 }
 
 void FurutaRevisionSystem::updateStatistics(uint32_t dtUs)
@@ -1063,6 +1136,11 @@ void FurutaRevisionSystem::updateStatistics(uint32_t dtUs)
     if (dtUs < statistics_.minControlDtUs) statistics_.minControlDtUs = dtUs;
     statistics_.sumControlDtUs += dtUs;
 
+    statistics_.sumPhiDeg += state_.phi * FurutaConfig::RAD_TO_DEG_LOCAL;
+    statistics_.sumBetaDeg += state_.beta * FurutaConfig::RAD_TO_DEG_LOCAL;
+    statistics_.sumControlDegS2 +=
+        control_.appliedRadS2 * FurutaConfig::RAD_TO_DEG_LOCAL;
+
     statistics_.sensorErrorCount = totalSensorErrors_;
 }
 
@@ -1081,13 +1159,13 @@ int16_t FurutaRevisionSystem::toInt16Scaled(float value, float scale)
 void FurutaRevisionSystem::resetDebugTrace()
 {
     debugSampleCount_ = 0;
+    debugWriteIndex_ = 0;
     debugDecimationCounter_ = 0;
 }
 
 void FurutaRevisionSystem::recordDebugTrace(uint32_t nowUs)
 {
-    if (debugSampleCount_ >= RevisionConfig::DEBUG_MAX_SAMPLES)
-        return;
+    (void)nowUs;
 
     if (debugDecimationCounter_ != 0)
     {
@@ -1097,62 +1175,190 @@ void FurutaRevisionSystem::recordDebugTrace(uint32_t nowUs)
         return;
     }
 
-    DebugSample &sample = debugSamples_[debugSampleCount_++];
+    DebugSample &sample = debugSamples_[debugWriteIndex_];
 
-    (void)nowUs;
+    const float phiDeg = state_.phi * FurutaConfig::RAD_TO_DEG_LOCAL;
+    const float betaDeg = state_.beta * FurutaConfig::RAD_TO_DEG_LOCAL;
+    const float uDegS2 = control_.appliedRadS2 * FurutaConfig::RAD_TO_DEG_LOCAL;
 
-    sample.phi1e4 = toInt16Scaled(state_.phi, 10000.0F);
-    sample.phiDot1e4 = toInt16Scaled(state_.phiDot, 10000.0F);
-    sample.beta1e5 = toInt16Scaled(state_.beta, 100000.0F);
+    sample.phiCdeg = toInt16Scaled(phiDeg, 100.0F);
+    sample.betaMdeg = toInt16Scaled(betaDeg, 1000.0F);
     sample.betaDot5e3 = toInt16Scaled(state_.betaDot, 5000.0F);
+    sample.uDegS2 = toInt16Scaled(uDegS2, 1.0F);
+
+    debugWriteIndex_ = static_cast<uint8_t>(
+        (debugWriteIndex_ + 1U) % RevisionConfig::DEBUG_MAX_SAMPLES
+    );
+
+    if (debugSampleCount_ < RevisionConfig::DEBUG_MAX_SAMPLES)
+        ++debugSampleCount_;
 
     debugDecimationCounter_ = 1;
 }
 
 void FurutaRevisionSystem::dumpDebugTrace()
 {
-    Serial.println(F("#DBG_BEGIN"));
-    Serial.println(F("#t_nom,phi,pd,b,bd,Tphi,Tpd,Tb,Tbd,uRaw,uApp"));
+    Serial.println(F("#TAIL_BEGIN"));
+    Serial.println(F("#t_to_end_ms,phi_deg,beta_deg,betaDot,u_deg_s2"));
 
-    for (uint8_t i = 0; i < debugSampleCount_; ++i)
+    if (debugSampleCount_ == 0)
     {
-        const DebugSample &sample = debugSamples_[i];
-
-        const float phi = static_cast<float>(sample.phi1e4) / 10000.0F;
-        const float phiDot = static_cast<float>(sample.phiDot1e4) / 10000.0F;
-        const float beta = static_cast<float>(sample.beta1e5) / 100000.0F;
-        const float betaDot = static_cast<float>(sample.betaDot5e3) / 5000.0F;
-
-        const float phiTerm = settings_.kPhi * phi;
-        const float phiDotTerm = settings_.kPhiDot * phiDot;
-        const float betaTerm = settings_.kBeta * beta;
-        const float betaDotTerm = settings_.kBetaDot * betaDot;
-        const float raw = phiTerm + phiDotTerm + betaTerm + betaDotTerm;
-        float applied = raw;
-        if (applied > (settings_.maxAccelDegS2 * FurutaConfig::DEG_TO_RAD_LOCAL))
-            applied = (settings_.maxAccelDegS2 * FurutaConfig::DEG_TO_RAD_LOCAL);
-        if (applied < -(settings_.maxAccelDegS2 * FurutaConfig::DEG_TO_RAD_LOCAL))
-            applied = -(settings_.maxAccelDegS2 * FurutaConfig::DEG_TO_RAD_LOCAL);
-
-        const uint16_t tNomMs = static_cast<uint16_t>(
-            (1UL + static_cast<uint32_t>(i) * RevisionConfig::DEBUG_DECIMATION)
-            * settings_.controlPeriodUs / 1000UL
-        );
-
-        Serial.print(tNomMs);
-        Serial.print(','); Serial.print(phi, 5);
-        Serial.print(','); Serial.print(phiDot, 5);
-        Serial.print(','); Serial.print(beta, 5);
-        Serial.print(','); Serial.print(betaDot, 4);
-        Serial.print(','); Serial.print(phiTerm, 3);
-        Serial.print(','); Serial.print(phiDotTerm, 3);
-        Serial.print(','); Serial.print(betaTerm, 3);
-        Serial.print(','); Serial.print(betaDotTerm, 3);
-        Serial.print(','); Serial.print(raw, 3);
-        Serial.print(','); Serial.println(applied, 3);
+        Serial.println(F("#TAIL_END"));
+        return;
     }
 
-    Serial.println(F("#DBG_END"));
+    const uint8_t oldestIndex =
+        (debugSampleCount_ < RevisionConfig::DEBUG_MAX_SAMPLES)
+        ? 0
+        : debugWriteIndex_;
+
+    const uint32_t tracePeriodMs =
+        (settings_.controlPeriodUs * RevisionConfig::DEBUG_DECIMATION) / 1000UL;
+
+    for (uint8_t logical = 0; logical < debugSampleCount_; ++logical)
+    {
+        const uint8_t physical = static_cast<uint8_t>(
+            (oldestIndex + logical) % RevisionConfig::DEBUG_MAX_SAMPLES
+        );
+
+        const DebugSample &sample = debugSamples_[physical];
+
+        const float phiDeg = static_cast<float>(sample.phiCdeg) / 100.0F;
+        const float betaDeg = static_cast<float>(sample.betaMdeg) / 1000.0F;
+        const float betaDot = static_cast<float>(sample.betaDot5e3) / 5000.0F;
+        const int16_t uDegS2 = sample.uDegS2;
+
+        // Ultima amostra ~= 0 ms; anteriores aparecem com tempo negativo.
+        const int32_t samplesToEnd =
+            static_cast<int32_t>(debugSampleCount_ - 1U - logical);
+        const int32_t tToEndMs =
+            -samplesToEnd * static_cast<int32_t>(tracePeriodMs);
+
+        Serial.print(tToEndMs);
+        Serial.print(','); Serial.print(phiDeg, 2);
+        Serial.print(','); Serial.print(betaDeg, 3);
+        Serial.print(','); Serial.print(betaDot, 4);
+        Serial.print(','); Serial.println(uDegS2);
+    }
+
+    Serial.println(F("#TAIL_END"));
+}
+
+
+// ============================================================
+// HISTORICO RAW — EEPROM
+// ============================================================
+
+void FurutaRevisionSystem::rawHistoryInit()
+{
+    if (!settings_.rawHistoryEnabled) return;
+
+    const bool valid =
+        EEPROM.read(RAW_ADDR_MAGIC) == RAW_MAGIC &&
+        EEPROM.read(RAW_ADDR_VERSION) == RAW_VERSION &&
+        EEPROM.read(RAW_ADDR_COUNT) <= RAW_HISTORY_CAPACITY &&
+        EEPROM.read(RAW_ADDR_NEXT) < RAW_HISTORY_CAPACITY;
+
+    if (valid) return;
+
+    EEPROM.update(RAW_ADDR_MAGIC, RAW_MAGIC);
+    EEPROM.update(RAW_ADDR_VERSION, RAW_VERSION);
+    EEPROM.update(RAW_ADDR_COUNT, 0);
+    EEPROM.update(RAW_ADDR_NEXT, 0);
+}
+
+uint16_t FurutaRevisionSystem::rawHistoryReadValue(uint8_t logicalIndex) const
+{
+    const uint8_t count = EEPROM.read(RAW_ADDR_COUNT);
+    const uint8_t next = EEPROM.read(RAW_ADDR_NEXT);
+
+    if (logicalIndex >= count || count == 0) return 0;
+
+    const uint8_t start =
+        (count < RAW_HISTORY_CAPACITY)
+        ? 0
+        : next;
+
+    const uint8_t physicalIndex =
+        static_cast<uint8_t>((start + logicalIndex) % RAW_HISTORY_CAPACITY);
+
+    const int address = RAW_ADDR_DATA + static_cast<int>(physicalIndex) * 2;
+    const uint16_t low = EEPROM.read(address);
+    const uint16_t high = EEPROM.read(address + 1);
+    return static_cast<uint16_t>(low | (high << 8));
+}
+
+void FurutaRevisionSystem::rawHistoryAppend(uint16_t raw)
+{
+    rawHistoryInit();
+
+    uint8_t count = EEPROM.read(RAW_ADDR_COUNT);
+    uint8_t next = EEPROM.read(RAW_ADDR_NEXT);
+
+    const int address = RAW_ADDR_DATA + static_cast<int>(next) * 2;
+    EEPROM.update(address, static_cast<uint8_t>(raw & 0xFF));
+    EEPROM.update(address + 1, static_cast<uint8_t>((raw >> 8) & 0xFF));
+
+    next = static_cast<uint8_t>((next + 1) % RAW_HISTORY_CAPACITY);
+    if (count < RAW_HISTORY_CAPACITY) ++count;
+
+    EEPROM.update(RAW_ADDR_COUNT, count);
+    EEPROM.update(RAW_ADDR_NEXT, next);
+
+    uint16_t minRaw = 4095;
+    uint16_t maxRaw = 0;
+    uint32_t sumRaw = 0;
+
+    for (uint8_t i = 0; i < count; ++i)
+    {
+        const uint16_t value = rawHistoryReadValue(i);
+        if (value < minRaw) minRaw = value;
+        if (value > maxRaw) maxRaw = value;
+        sumRaw += value;
+    }
+
+    const int16_t delta =
+        static_cast<int16_t>(raw) -
+        static_cast<int16_t>(settings_.rawReferenceCounts);
+
+    Serial.print(F("RAWLOG,n=")); Serial.print(count);
+    Serial.print(F(",last=")); Serial.print(raw);
+    Serial.print(F(",dref="));
+    if (delta >= 0) Serial.print('+');
+    Serial.print(delta);
+    Serial.print(F(",min=")); Serial.print(minRaw);
+    Serial.print(F(",max=")); Serial.print(maxRaw);
+    Serial.print(F(",mean="));
+    Serial.println(static_cast<float>(sumRaw) / static_cast<float>(count), 2);
+}
+
+void FurutaRevisionSystem::printRawHistory()
+{
+    if (!settings_.rawHistoryEnabled)
+    {
+        Serial.println(F("RAWLOG,OFF"));
+        return;
+    }
+
+    rawHistoryInit();
+    const uint8_t count = EEPROM.read(RAW_ADDR_COUNT);
+
+    Serial.print(F("RAW,HIST,n=")); Serial.print(count);
+    Serial.print(F(",ref=")); Serial.print(settings_.rawReferenceCounts);
+    Serial.print(F(",values="));
+
+    if (count == 0)
+    {
+        Serial.println(F("-"));
+        return;
+    }
+
+    for (uint8_t i = 0; i < count; ++i)
+    {
+        if (i > 0) Serial.print('/');
+        Serial.print(rawHistoryReadValue(i));
+    }
+    Serial.println();
 }
 
 // ============================================================
@@ -1170,13 +1376,15 @@ void FurutaRevisionSystem::printParameters()
     Serial.print(F(",V=")); Serial.print(settings_.motorMaxSpeedDegS, 0);
     Serial.print(F(",A=")); Serial.print(settings_.maxAccelDegS2, 0);
     Serial.print(F(",MS=")); Serial.print(FurutaConfig::MICROSTEP_FACTOR);
-    Serial.print(F(",OFF=")); Serial.print(settings_.topReferenceOffsetDeg, 1);
+    Serial.print(F(",OFF=")); Serial.print(settings_.topReferenceOffsetDeg, 3);
     Serial.print(F(",CAP=")); Serial.print(settings_.captureBetaMaxDeg, 2);
     Serial.print('/'); Serial.print(settings_.captureBetaDotMaxRadS, 2);
     Serial.print(F(",REL=")); Serial.print(settings_.releaseBetaMaxDeg, 2);
     Serial.print('/'); Serial.print(settings_.releaseVelocityRadS, 2);
     Serial.print(F(",DBG=")); Serial.print(RevisionConfig::DEBUG_MAX_SAMPLES);
-    Serial.print('/'); Serial.println(RevisionConfig::DEBUG_DECIMATION);
+    Serial.print('/'); Serial.print(RevisionConfig::DEBUG_DECIMATION);
+    Serial.print(F(",RAWFIX=")); Serial.print(settings_.rawReferenceCounts);
+    Serial.print(F(",RLOG=")); Serial.println(settings_.rawHistoryEnabled ? 1 : 0);
 }
 
 void FurutaRevisionSystem::printStatus()
@@ -1190,6 +1398,7 @@ void FurutaRevisionSystem::printStatus()
     Serial.print(F(",b=")); Serial.print(state_.beta * FurutaConfig::RAD_TO_DEG_LOCAL, 3);
     Serial.print(F(",bd=")); Serial.print(state_.betaDot, 4);
     Serial.print(F(",phi=")); Serial.print(state_.phi * FurutaConfig::RAD_TO_DEG_LOCAL, 2);
+    Serial.print(F(",raw=")); Serial.print(pendulumPosition_.raw());
     Serial.print(F(",err=")); Serial.println(totalSensorErrors_);
 }
 
@@ -1216,7 +1425,20 @@ void FurutaRevisionSystem::printBalanceSummary(const char *reason)
     Serial.print(F(",bmax=")); Serial.print(statistics_.maxAbsBetaRad * FurutaConfig::RAD_TO_DEG_LOCAL, 3);
     Serial.print(F(",phimax=")); Serial.print(statistics_.maxAbsPhiDeg, 2);
     Serial.print(F(",umax=")); Serial.print(statistics_.maxAbsControlDegS2, 1);
+    Serial.print(F(",bdmax=")); Serial.print(statistics_.maxAbsBetaDotRadS, 3);
+    Serial.print(F(",pdmax=")); Serial.print(statistics_.maxAbsPhiDotDegS, 1);
     Serial.print(F(",sat=")); Serial.print(statistics_.saturationCount);
+
+    if (statistics_.sampleCount > 0)
+    {
+        const float invN = 1.0F / static_cast<float>(statistics_.sampleCount);
+        Serial.print(F(",phimean=")); Serial.print(statistics_.sumPhiDeg * invN, 2);
+        Serial.print(F(",bmean=")); Serial.print(statistics_.sumBetaDeg * invN, 3);
+        Serial.print(F(",umean=")); Serial.print(statistics_.sumControlDegS2 * invN, 1);
+    }
+
+    Serial.print(F(",phiend="));
+    Serial.print(state_.phi * FurutaConfig::RAD_TO_DEG_LOCAL, 2);
     Serial.print(F(",err=")); Serial.println(totalSensorErrors_);
 }
 
@@ -1243,7 +1465,7 @@ void FurutaRevisionSystem::serviceSerial()
             continue;
         }
 
-        if (serialBufferIndex_ < FurutaConfig::SERIAL_BUFFER_SIZE - 1)
+        if (serialBufferIndex_ < RevisionConfig::SERIAL_BUFFER_SIZE - 1)
         {
             serialBuffer_[serialBufferIndex_++] = c;
         }
@@ -1278,11 +1500,16 @@ void FurutaRevisionSystem::handleCommand(char *command)
         return;
     }
 
+    if (handleTuningCommand(command)) return;
+
     if (command[1] == '\0')
     {
         switch (command[0])
         {
-            case 'T': startDownCalibration(); return;
+            case 'T':
+                Serial.print(F("T,SKIP,FIXED_RAW="));
+                Serial.println(settings_.rawReferenceCounts);
+                return;
             case 'V': toggleTopDiagnostic(); return;
             case 'O': toggleTopMeasurement(); return;
             case 'Z': defineArmZero(); return;
@@ -1292,6 +1519,7 @@ void FurutaRevisionSystem::handleCommand(char *command)
             case 'X': emergencyStop(); return;
             case 'S': printStatus(); return;
             case 'P': printParameters(); return;
+            case 'R': printRawHistory(); return;
             case 'H': case '?': printHelp(); return;
         }
     }
@@ -1300,7 +1528,209 @@ void FurutaRevisionSystem::handleCommand(char *command)
     Serial.println(F("ERR,CMD"));
 }
 
+bool FurutaRevisionSystem::parseOneFloat(const char *text, float &value)
+{
+    const char *p = text;
+    while (*p && isspace(static_cast<unsigned char>(*p))) ++p;
+
+    float sign = 1.0F;
+    if (*p == '-') { sign = -1.0F; ++p; }
+    else if (*p == '+') { ++p; }
+
+    bool hasDigit = false;
+    float result = 0.0F;
+
+    while (*p >= '0' && *p <= '9')
+    {
+        hasDigit = true;
+        result = result * 10.0F + static_cast<float>(*p - '0');
+        ++p;
+    }
+
+    if (*p == '.')
+    {
+        ++p;
+        float scale = 0.1F;
+        while (*p >= '0' && *p <= '9')
+        {
+            hasDigit = true;
+            result += static_cast<float>(*p - '0') * scale;
+            scale *= 0.1F;
+            ++p;
+        }
+    }
+
+    while (*p && isspace(static_cast<unsigned char>(*p))) ++p;
+    if (!hasDigit || *p != '\0') return false;
+
+    value = sign * result;
+    return true;
+}
+
+bool FurutaRevisionSystem::parseFourFloats(
+    const char *text,
+    float &a,
+    float &b,
+    float &c,
+    float &d
+)
+{
+    float *out[4] = {&a, &b, &c, &d};
+    const char *p = text;
+
+    for (uint8_t i = 0; i < 4; ++i)
+    {
+        while (*p && isspace(static_cast<unsigned char>(*p))) ++p;
+        if (*p == '\0') return false;
+
+        float sign = 1.0F;
+        if (*p == '-') { sign = -1.0F; ++p; }
+        else if (*p == '+') { ++p; }
+
+        bool hasDigit = false;
+        float result = 0.0F;
+
+        while (*p >= '0' && *p <= '9')
+        {
+            hasDigit = true;
+            result = result * 10.0F + static_cast<float>(*p - '0');
+            ++p;
+        }
+
+        if (*p == '.')
+        {
+            ++p;
+            float scale = 0.1F;
+            while (*p >= '0' && *p <= '9')
+            {
+                hasDigit = true;
+                result += static_cast<float>(*p - '0') * scale;
+                scale *= 0.1F;
+                ++p;
+            }
+        }
+
+        if (!hasDigit) return false;
+        *out[i] = sign * result;
+
+        if (i < 3)
+        {
+            if (!isspace(static_cast<unsigned char>(*p))) return false;
+        }
+    }
+
+    while (*p && isspace(static_cast<unsigned char>(*p))) ++p;
+    return *p == '\0';
+}
+
+bool FurutaRevisionSystem::setSingleRuntimeParameter(
+    const char *name,
+    float value
+)
+{
+    // Faixas deliberadamente conservadoras para evitar comandos absurdos.
+    // Nao elevamos AMAX acima do limite atualmente usado nos ensaios.
+    if (strcmp(name, "KPHI") == 0)
+    {
+        if (value < 0.0F || value > 5.0F) return false;
+        settings_.kPhi = value;
+    }
+    else if (strcmp(name, "KPD") == 0)
+    {
+        if (value < 0.0F || value > 10.0F) return false;
+        settings_.kPhiDot = value;
+    }
+    else if (strcmp(name, "KB") == 0)
+    {
+        if (value < 0.0F || value > 150.0F) return false;
+        settings_.kBeta = value;
+    }
+    else if (strcmp(name, "KBD") == 0)
+    {
+        if (value < 0.0F || value > 20.0F) return false;
+        settings_.kBetaDot = value;
+    }
+    else if (strcmp(name, "AMAX") == 0)
+    {
+        if (value < 50.0F || value > 600.0F) return false;
+        settings_.maxAccelDegS2 = value;
+    }
+    else
+    {
+        return false;
+    }
+
+    Serial.print(F("SET,")); Serial.print(name);
+    Serial.print('='); Serial.println(value, 6);
+    return true;
+}
+
+bool FurutaRevisionSystem::handleTuningCommand(char *command)
+{
+    // Nunca alteramos parametros com a maquina armada ou controlando.
+    if (controlState_ != ControlState::IDLE)
+        return false;
+
+    if (strncmp(command, "K ", 2) == 0)
+    {
+        float k1, k2, k3, k4;
+        if (!parseFourFloats(command + 2, k1, k2, k3, k4))
+        {
+            Serial.println(F("ERR,K,FORMAT"));
+            return true;
+        }
+
+        if (
+            k1 < 0.0F || k1 > 5.0F ||
+            k2 < 0.0F || k2 > 10.0F ||
+            k3 < 0.0F || k3 > 150.0F ||
+            k4 < 0.0F || k4 > 20.0F
+        )
+        {
+            Serial.println(F("ERR,K,RANGE"));
+            return true;
+        }
+
+        settings_.kPhi = k1;
+        settings_.kPhiDot = k2;
+        settings_.kBeta = k3;
+        settings_.kBetaDot = k4;
+
+        Serial.print(F("SET,K="));
+        Serial.print(settings_.kPhi, 6); Serial.print(',');
+        Serial.print(settings_.kPhiDot, 6); Serial.print(',');
+        Serial.print(settings_.kBeta, 6); Serial.print(',');
+        Serial.println(settings_.kBetaDot, 6);
+        return true;
+    }
+
+    const char *names[] = {"KPHI", "KPD", "KB", "KBD", "AMAX"};
+    for (uint8_t i = 0; i < 5; ++i)
+    {
+        const size_t len = strlen(names[i]);
+        if (strncmp(command, names[i], len) == 0 && command[len] == ' ')
+        {
+            float value;
+            if (!parseOneFloat(command + len + 1, value))
+            {
+                Serial.print(F("ERR,")); Serial.print(names[i]);
+                Serial.println(F(",FORMAT"));
+                return true;
+            }
+
+            if (!setSingleRuntimeParameter(names[i], value))
+            {
+                Serial.print(F("ERR,")); Serial.print(names[i]);
+                Serial.println(F(",RANGE"));
+            }
+            return true;
+        }
+    }
+
+    return false;
+}
+
 void FurutaRevisionSystem::printHelp()
 {
-    Serial.println(F("H:D Z E T | O V | B(tight,trace RAM) | STOP X S P"));
+    Serial.println(F("H:D Z E B | P S R | K <kp kpd kb kbd> | KPHI/KPD/KB/KBD <v> | AMAX <v> | T=skip | STOP X"));
 }
